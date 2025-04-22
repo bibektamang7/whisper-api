@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  whisper-transcription:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - WHISPER_MODEL=base  # Options: tiny, base, small, medium, large
+      - PORT=8000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
