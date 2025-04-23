@@ -4,7 +4,7 @@ import whisper
 import uvicorn
 import logging
 import requests
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, File, UploadFile
 from fastapi.responses import JSONResponse
 from typing import Optional
 import subprocess
@@ -24,12 +24,12 @@ app = FastAPI(title="Whisper Transcription API")
 MODEL_SIZE = os.environ.get("WHISPER_MODEL", "base") 
 model = None
 
-# Define request model
+# Define request model for JSON requests
 class TranscriptionRequest(BaseModel):
     url: AnyHttpUrl
-    task: Optional[str] = "transcribe"  # Can be 'transcribe' or 'translate'
+    task: Optional[str] = "transcribe"
     language: Optional[str] = None
-    output_format: Optional[str] = "json"  # Can be 'json', 'text', 'srt', 'vtt'
+    output_format: Optional[str] = "json"
 
 def load_model():
     global model
@@ -67,54 +67,44 @@ def extract_audio(video_path, output_path):
         logger.error(f"Error extracting audio: {e}")
         return False
 
-@app.post("/transcribe/")
-async def transcribe_url(request: TranscriptionRequest):
-    logger.info(f"Received URL: {request.url}")
-    
-    # Create temp files for video and audio
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as video_file:
-        video_path = video_file.name
-    
+def process_transcription(video_path, task, language, output_format):
+    """Process transcription from video file."""
     audio_path = f"{video_path}.wav"
     
     try:
-        # Download video from URL
-        if not download_video(request.url, video_path):
-            return JSONResponse(
-                status_code=500,
-                content={"error": "Failed to download video from URL"}
-            )
-        
         # Extract audio from video
         if not extract_audio(video_path, audio_path):
-            return JSONResponse(
-                status_code=500,
-                content={"error": "Failed to extract audio from video file"}
-            )
+            return None, "Failed to extract audio from video file"
         
         # Transcribe audio
         transcribe_options = {
-            "task": request.task,
-            "fp16": False
+            "task": task,
+            "fp16": False,
+            "temperature": 0.0,   
+            "best_of": 1,
+            "beam_size": 1,
         }
         
-        if request.language:
-            transcribe_options["language"] = request.language
+        if language:
+            transcribe_options["language"] = language
+        
+        if hasattr(whisper.DecodingOptions, "temperature_increment_on_fallback"):
+                transcribe_options["temperature_increment_on_fallback"] = 0.0
             
         logger.info(f"Starting transcription with options: {transcribe_options}")
         result = model.transcribe(audio_path, **transcribe_options)
         
         # Format output based on request
         response_content = {}
-        if request.output_format == "json":
+        if output_format == "json":
             response_content = {
                 "text": result["text"],
                 "segments": result["segments"],
                 "language": result["language"]
             }
-        elif request.output_format == "text":
+        elif output_format == "text":
             response_content = {"text": result["text"]}
-        elif request.output_format in ["srt", "vtt"]:
+        elif output_format in ["srt", "vtt"]:
             # Convert segments to SRT or VTT format
             formatted_text = ""
             for i, segment in enumerate(result["segments"]):
@@ -130,22 +120,148 @@ async def transcribe_url(request: TranscriptionRequest):
                 
             response_content = {"formatted_text": formatted_text}
             
-        return response_content
-    
+        return response_content, None
     except Exception as e:
         logger.error(f"Error during transcription: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Transcription failed: {str(e)}"}
-        )
+        return None, f"Transcription failed: {str(e)}"
     finally:
-        # Clean up temp files
+        # Clean up audio file
         try:
-            os.unlink(video_path)
             if os.path.exists(audio_path):
                 os.unlink(audio_path)
         except Exception as e:
-            logger.error(f"Error cleaning up temp files: {e}")
+            logger.error(f"Error cleaning up audio file: {e}")
+
+# JSON endpoint for URL-based transcription
+@app.post("/transcribe/")
+async def transcribe_url(request: TranscriptionRequest):
+    logger.info(f"Received URL: {request.url}")
+    
+    # Create temp file for video
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as video_file:
+        video_path = video_file.name
+    
+    try:
+        # Download video from URL
+        if not download_video(request.url, video_path):
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Failed to download video from URL"}
+            )
+        
+        # Process transcription
+        result, error = process_transcription(
+            video_path, 
+            request.task, 
+            request.language, 
+            request.output_format
+        )
+        
+        if error:
+            return JSONResponse(
+                status_code=500,
+                content={"error": error}
+            )
+        
+        return result
+    
+    finally:
+        # Clean up video file
+        try:
+            os.unlink(video_path)
+        except Exception as e:
+            logger.error(f"Error cleaning up video file: {e}")
+
+# Form-based endpoint for URL transcription (for compatibility)
+@app.post("/transcribe-form/")
+async def transcribe_url_form(
+    url: str = Form(...),
+    task: Optional[str] = Form("transcribe"),
+    language: Optional[str] = Form(None),
+    output_format: Optional[str] = Form("json")
+):
+    logger.info(f"Received URL via form: {url}")
+    
+    # Create temp file for video
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as video_file:
+        video_path = video_file.name
+    
+    try:
+        # Download video from URL
+        if not download_video(url, video_path):
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Failed to download video from URL"}
+            )
+        
+        # Process transcription
+        result, error = process_transcription(
+            video_path, 
+            task, 
+            language, 
+            output_format
+        )
+        
+        if error:
+            return JSONResponse(
+                status_code=500,
+                content={"error": error}
+            )
+        
+        return result
+    
+    finally:
+        # Clean up video file
+        try:
+            os.unlink(video_path)
+        except Exception as e:
+            logger.error(f"Error cleaning up video file: {e}")
+
+# File upload endpoint (keeping for backward compatibility)
+@app.post("/upload-and-transcribe/")
+async def upload_and_transcribe(
+    file: UploadFile = File(...),
+    task: Optional[str] = Form("transcribe"),
+    language: Optional[str] = Form(None),
+    output_format: Optional[str] = Form("json")
+):
+    if not file:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No file provided"}
+        )
+    
+    logger.info(f"Received file: {file.filename}")
+    
+    # Create temp file for video
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file.filename.split('.')[-1]}") as video_file:
+        # Write uploaded file to temp file
+        video_file.write(await file.read())
+        video_path = video_file.name
+    
+    try:
+        # Process transcription
+        result, error = process_transcription(
+            video_path, 
+            task, 
+            language, 
+            output_format
+        )
+        
+        if error:
+            return JSONResponse(
+                status_code=500,
+                content={"error": error}
+            )
+        
+        return result
+    
+    finally:
+        # Clean up video file
+        try:
+            os.unlink(video_path)
+        except Exception as e:
+            logger.error(f"Error cleaning up video file: {e}")
 
 @app.get("/health")
 async def health_check():
